@@ -7,7 +7,7 @@ class ThriftFileParsingError extends SyntaxError {
   }
 }
 
-module.exports = (source, offset = 0) => {
+module.exports = (source, offset = 0, options = {commentChars:[]}) => {
 
   source += '';
 
@@ -15,10 +15,19 @@ module.exports = (source, offset = 0) => {
   let rCount = 0;
 
   let stack = [];
+  let lastComment = null;
 
   const record = char => {
-    if (char === '\r') rCount++;
-    else if (char === '\n') nCount++;
+    if (char === '\r') {
+      rCount++;
+      if (lastComment != null) lastComment.offset++;
+    }
+    else if (char === '\n') {
+      nCount++;
+      if (lastComment != null) lastComment.offset++;
+    } else if ((lastComment != null) && (char === '\t' || char === ' ')) {
+      lastComment.offset++;
+    }
   };
   const save = () => stack.push({ offset, nCount, rCount });
   const restore = () => ({ offset, nCount, rCount } = stack[stack.length - 1]);
@@ -78,31 +87,48 @@ module.exports = (source, offset = 0) => {
 
   const readCommentMultiple = () => {
     let i = 0;
-    if (source[offset + i++] !== '/' || source[offset + i++] !== '*') return false;
+    let value = ""
+    if (source[offset + i++] !== '/' || source[offset + i++] !== '*') throw "Not this";
     do {
       record(source[offset + i]);
+      
+      if (source[offset +i] !== '*') {
+        value += source[offset + i]
+      }
+
       while (offset + i < source.length && source[offset + i++] !== '*') {
         record(source[offset + i]);
+        if (source[offset +i] !== '*') {
+          value += source[offset + i]
+        }
       }
     } while (offset + i < source.length && source[offset + i] !== '/');
     offset += i + 1;
-    return true;
+    return ["/*", value.trim()];
   };
 
   const readCommentSharp = () => {
     let i = 0;
-    if (source[offset + i++] !== '#') return false;
-    while (source[offset + i] !== '\n' && source[offset + i] !== '\r') offset++;
+    if (source[offset + i++] !== '#')  throw "Not this";
+    while (source[offset + i] !== '\n' && source[offset + i] !== '\r') i++;
+    let value = "";
+    if (i > 1) {
+      value = source.slice(offset + 1, offset + i);
+    }
     offset += i;
-    return true;
+    return ["#", value.trim()];
   };
 
   const readCommentDoubleSlash = () => {
     let i = 0;
-    if (source[offset + i++] !== '/' || source[offset + i++] !== '/') return false;
-    while (source[offset + i] !== '\n' && source[offset + i] !== '\r') offset++;
+    if (source[offset + i++] !== '/' || source[offset + i++] !== '/') throw "Not my comment";
+    while (source[offset + i] !== '\n' && source[offset + i] !== '\r') i++;
+    let value = "";
+    if (i > 2) {
+      value = source.slice(offset + 2, offset + i);
+    }
     offset += i;
-    return true;
+    return ["//", value.trim()];
   };
 
   const readSpace = () => {
@@ -112,7 +138,17 @@ module.exports = (source, offset = 0) => {
       if (byte === '\n' || byte === '\r' || byte === ' ' || byte === '\t') {
         offset++;
       } else {
-        if (!readCommentMultiple() && !readCommentSharp() && !readCommentDoubleSlash()) return;
+        try {
+          let [type, comment] = readAnyOne(readCommentDoubleSlash, readCommentMultiple, readCommentSharp);
+          if ( options.commentChars.indexOf(type) != -1) {
+            lastComment = {
+              offset: offset,
+              comment: comment
+            }
+          }
+        } catch (ignore) {
+          return;
+        }
       }
     }
   };
@@ -423,7 +459,7 @@ module.exports = (source, offset = 0) => {
     readComma();
     let result = {name};
     if (value !== void 0) result.value = value;
-    return result;
+    return consumeComment(result);
   };
 
   const readEnumValue = () => {
@@ -453,7 +489,8 @@ module.exports = (source, offset = 0) => {
     let subject = readKeyword('struct');
     let name = readName();
     let items = readStructLikeBlock();
-    return {subject, name, items};
+    let value = {subject, name, items};
+    return value
   };
 
   const readStructLikeBlock = () => {
@@ -481,7 +518,7 @@ module.exports = (source, offset = 0) => {
     if (id !== void 0) result.id = id;
     if (option !== void 0) result.option = option;
     if (defaultValue !== void 0) result.defaultValue = defaultValue;
-    return result;
+    return consumeComment(result);
   };
 
   const readUnion = () => {
@@ -602,8 +639,22 @@ module.exports = (source, offset = 0) => {
   };
 
   const readSubject = () => {
-    return readAnyOne(readTypedef, readConst, readEnum, readStruct, readUnion, readException, readService, readNamespace, readInclude);
+    return consumeComment(readAnyOne(readTypedef, readConst, readEnum, readStruct, readUnion, readException, readService, readNamespace, readInclude));
   };
+
+  const consumeComment = (content) => {
+    // Don't consume a comment unless we're reading
+    // the thing following it (i.e. our offset is greater
+    // than the last whitespace character following the comment
+    if (lastComment != null && lastComment.offset <= offset) {
+      console.log("Current offset: ", offset)
+      console.log("Attaching comment to ", content, lastComment)
+      content.comment = lastComment.comment;
+      lastComment = null;
+    }
+
+    return content;
+  }
 
   const readThrift = () => {
     readSpace();
@@ -619,11 +670,19 @@ module.exports = (source, offset = 0) => {
           case 'exception':
           case 'struct':
           case 'union':
-            storage[subject][name] = block.items;
+            if (options.commentChars.length != 0) {
+              let fields = block.items;
+              delete block.items;
+              storage[subject][name] = block;
+              storage[subject][name].fields = fields;
+            } else {
+              storage[subject][name] = block.items;
+            }
             break;
           default:
             storage[subject][name] = block;
         }
+        console.log("Value! ", storage[subject][name])
       } catch (message) {
         let context = source.slice(offset, offset + 50);
         let line = Math.max(nCount, rCount) + 1;
